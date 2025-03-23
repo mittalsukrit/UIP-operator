@@ -7,15 +7,19 @@ from pymoo.core.population import Population
 from pymoo.operators.crossover.sbx import SBX
 from pymoo.operators.mutation.pm import PM
 from pymoo.operators.sampling.rnd import FloatRandomSampling
-from pymoo.util.misc import set_if_none
 from pymoo.operators.selection.tournament import TournamentSelection, compare
 from pymoo.util.normalization import normalize
 from pymoo.util.function_loader import load_function
 from pymoo.core.survival import Survival
 from pymoo.util.display.multi import MultiObjectiveOutput
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
-from pymoo.util.misc import intersect, has_feasible
+from pymoo.util.misc import intersect
 from copy import deepcopy
+import math
+from scipy.spatial.distance import cdist, euclidean
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from pymoo.util.normalization import normalize, denormalize
 
 # =========================================================================================================
 # Implementation
@@ -49,6 +53,8 @@ class NSGA3(GeneticAlgorithm):
                  eliminate_duplicates=True,
                  n_offsprings=None,
                  output=MultiObjectiveOutput(),
+                 is_co_learn = False,
+                 is_do_learn = False,
                  **kwargs):
         """
 
@@ -72,7 +78,7 @@ class NSGA3(GeneticAlgorithm):
         self.ref_dirs = ref_dirs
 
         """For overall termination"""
-        self.termination_suggestion = None
+        self.termination_suggestion = [None, None]
         self.termination_pop = None
 
         """Archives for stabilization tracking algorithm"""
@@ -80,6 +86,22 @@ class NSGA3(GeneticAlgorithm):
         self.D_t = []
         self.S_t = []
         self.Q = None
+
+        """Set the CO related parameters"""
+        self.collection = 5
+        self.co_target = None
+        self.co_start = False
+        self.co_survived = []
+        self.last_co_repair = 0
+        self.is_co_learn = is_co_learn
+        self.archive = []
+
+        """Set the DO related parameters"""
+        self.do_state = [0, 0, 0]
+        self.do_models = None
+        self.do_survived = []
+        self.last_do_learn = 0
+        self.is_do_learn = is_do_learn
 
         if pop_size is None:
             pop_size = len(self.ref_dirs)
@@ -102,6 +124,8 @@ class NSGA3(GeneticAlgorithm):
                          n_offsprings=n_offsprings,
                          output=output,
                          advance_after_initial_infill=True,
+                         is_co_learn = is_co_learn,
+                         is_do_learn = is_do_learn,
                          **kwargs)
     
     def _initialize(self):
@@ -117,12 +141,67 @@ class NSGA3(GeneticAlgorithm):
 
         self.pop = self.survival.do(self.problem, self.pop, n_survive=len(self.pop), algorithm=self)
 
+        """For CO"""
+        if self.is_co_learn:
+            self.child = []
+            X = np.array([None]*self.problem.n_var)
+            F = np.array([None]*self.problem.n_obj)
+            self.co_target = np.array([None]*len(self.ref_dirs))
+            for i in range (len(self.co_target)):
+                self.co_target[i] = [X,F]
+            self.co_frequency = 2 #since it is anyways adapted on-the-fly
+
+        """For DO"""
+        if self.is_do_learn:
+            self.do_models = [None]*self.problem.n_obj
+            self.termination_params = np.array([2, 20])
+            dist = cdist(self.ref_dirs, self.ref_dirs)
+            val = [np.sort(row)[1] for row in dist]
+            self.last_termination = 1
+            self.niche_radius = np.mean(val)
+            self.survival_history = []
+            self.niche_change = []
+            self.pop_for_boundary_change = []
+            self.do_trigger1 = False
+            self.do_trigger2 = False
+            self.do_frequency = 2 #since it is anyways adapted on-the-fly
+
         print("# Initialized successfully")
 
     def _infill(self):
 
         if self.n_gen % 100 == 0:
             print("# Generation: " + str(self.n_gen))
+
+        if self.is_co_learn:
+            self.archive.append(self.pop)
+
+        """Should we start CO?"""
+        if self.is_co_learn and self.co_start:
+            update_co_target(self)
+            if self.n_gen>self.collection+1 and self.n_gen-self.last_co_repair>=self.co_frequency:
+                print('CO learning now')
+                lower_bound,upper_bound, RF_model = co_learn(self)
+
+        """Set the trigger of non-domination"""
+        if self.do_trigger1==False and self.is_do_learn:
+            if self.problem.n_constr==0:
+                self.do_trigger1 = True
+            else:
+                CV = self.pop.get("CV")
+                if max(CV)==0:
+                    self.do_trigger1 = True
+
+        """Store the parent population in Q"""
+        if self.is_do_learn and self.do_trigger1:
+            Q = self.pop.get("F")
+            parent_niches = self.pop.get("niche")
+            parent_niches = np.unique(parent_niches)
+
+        """Call the Learn function"""
+        if self.is_do_learn and self.do_trigger2 and self.n_gen-self.last_do_learn>=self.do_frequency:
+            print('DO learning now')
+            do_learn(self)
 
         """Do the mating to produce the offspring self.off"""
         self.off = self.mating.do(self.problem, self.pop, self.n_offsprings, algorithm=self)
@@ -134,15 +213,30 @@ class NSGA3(GeneticAlgorithm):
         elif len(self.off) < self.n_offsprings:
             if self.verbose:
                 print("WARNING: Mating could not produce the required number of (unique) offsprings!")
+
+        """repair step:"""
+        if self.n_gen>self.collection+1 and self.is_co_learn and self.n_gen-self.last_co_repair>=self.co_frequency and self.co_start:
+            print('CO repairing now')
+            self.last_co_repair = self.n_gen
+            co_repair(self, lower_bound,upper_bound, RF_model)
+
+        """Call the Repair function and replace offspring"""
+        if self.is_do_learn and self.do_trigger2 and self.n_gen-self.last_do_learn>=self.do_frequency:
+            temp = [1 for model in self.do_models if model is None]
+            if sum(temp)==0:
+                print('DO repairing now')
+                self.last_do_learn = self.n_gen
+                new_solutions = do_repair(self)
+                sequence = np.arange(int(self.pop_size/2)) #DEXTER - offspring generated are already randomized - doesn't make sense to use another random input there
+                for i in range(len(new_solutions)):
+                    self.off[sequence[i]].X = np.array(new_solutions[i])
+
         self.evaluator.eval(self.problem, self.off, algorithm=self)
+        if self.is_co_learn:
+            self.child.append(self.off)
+
         self.Q = deepcopy(self.pop.get("F"))
-
-        # F1 = self.pop.get("F")
-        # F2 = self.off.get("F")
-        # print(np.min(F1, axis=0), np.min(F2, axis=0))
-
-        # print(self.n_gen)
-        # print(self.pop[10].F)
+        self.off_F = self.off.get("F")
 
         """Merge P_t and self.off into U_t"""
         self.pop = Population.merge(self.pop, self.off)
@@ -156,17 +250,66 @@ class NSGA3(GeneticAlgorithm):
         update_termination_archives(self, self.Q)
 
         """Check for termination"""
-        if self.termination_suggestion is None:
-            term_cond = check_for_termination(self,3,50) # {3, 50} are the parameters used for LHFiD termination
+        if self.termination_suggestion[0] is None:
+            term_cond = check_for_termination(self, 2, 20)
+            if term_cond:
+                self.termination_suggestion[0] = self.n_gen
+                print("mild stabilization has reached at gen: "+str(self.n_gen))
+
+        if self.termination_suggestion[1] is None:
+            term_cond = check_for_termination(self, 3, 50)
             if term_cond:
                 self.termination_suggestion = self.n_gen
                 self.termination_pop = self.pop
 
         """Terminate, if suggested by the stabilization tracking algorithm"""
-        if self.termination_suggestion is not None:
+        if self.termination_suggestion[1] is not None:
             print("# The algorithm terminated after " + str(self.n_gen) + " generations.")
             self.termination.force_termination = True
             return
+        
+        """co_frequency adaptation"""
+        df1 = self.pop.get("F")
+        df2 = self.off_F[int(self.pop_size/2):]
+        count = 0
+        for val in df1:
+            if sum(sum(df2==val))>0:
+                count+=1
+        self.co_survived.append(count)
+        if self.n_gen>self.collection+1 and self.is_co_learn and self.n_gen-self.last_co_repair==0 and self.co_start:
+            if self.co_survived[-1]>self.co_survived[-2] and self.co_frequency>2:
+                self.co_frequency-=1
+            elif self.co_survived[-1]<self.co_survived[-2]:
+                self.co_frequency+=1
+
+        """do_frequency adaptation"""
+        df1 = self.pop.get("F")
+        df2 = self.off_F[:int(self.pop_size/2)]
+        count = 0
+        for val in df1:
+            if sum(sum(df2==val))>0:
+                count+=1
+        self.do_survived.append(count)
+        if self.is_do_learn and self.do_trigger2 and self.n_gen-self.last_do_learn==0:
+            temp = [1 for model in self.do_models if model is None]
+            if sum(temp)==0:
+                if self.do_survived[-1]>self.do_survived[-2] and self.do_frequency>2:
+                    self.do_frequency-=1
+                elif self.do_survived[-1]<self.do_survived[-2]:
+                    self.do_frequency+=1
+        
+        """Check for starting DL operator"""
+        if self.is_do_learn and self.do_trigger1==True and self.co_start==False:
+            ranks = [ind.data["rank"] for ind in self.pop]
+            # print(ranks)
+            if max(ranks)==0:
+                self.co_start = True
+            # if termination_flag and max(ranks)==0:
+        if self.is_do_learn and self.do_trigger1==True:
+            if self.do_trigger2==False:
+                termination_flag = check_for_termination(self, 2, 20)
+                if termination_flag:
+                    self.do_trigger2 = True
         
 """
 Self-termination algorithm
@@ -472,3 +615,337 @@ def get_nadir_point(extreme_points, ideal_point, worst_point, worst_of_front, wo
     nadir_point[b] = worst_of_population[b]
 
     return nadir_point
+
+def co_learn(self):
+    obj_data = []
+    design_data = []
+    input_data = []
+    output_data = []
+    for i in range(1,self.collection+1):
+        temp = self.child[-i]
+        for row in temp:
+            obj_data.append(row.F)
+            design_data.append(row.X)
+
+    """Adding the first parent pop to the archive"""
+    for row in self.archive[-(self.collection+1)]:
+        obj_data.append(row.F)
+        design_data.append(row.X)
+
+    """Normalize and map the archive points to the targets"""
+    nadir_point = self.pop[0].data['nadir_point']
+    ideal_point = self.pop[0].data['ideal_point']
+    if max(nadir_point) == math.inf:
+        nadir_point = np.max(self.pop.get("F"), axis=0)
+    obj_data = normalize(obj_data, xl = ideal_point-1e-12, xu = nadir_point)
+    for i in range(len(design_data)):
+        temp = load_function('calc_perpendicular_distance')([obj_data[i]],self.ref_dirs)[0]
+        ref_index = np.argmin(temp)
+        if self.co_target[ref_index][0][0] is not None:
+            input_data.append(design_data[i])
+            output_data.append(deepcopy(self.co_target[ref_index][0]))
+
+    input_data = np.array(input_data)
+    output_data = np.array(output_data)
+
+    input_copy = []
+    output_copy = []
+    
+    dup_index = []
+    for i in range (len(input_data)):
+        flag = False
+        for j in range(len(input_data[i])):
+            if math.isnan(input_data[i, j]) or math.isnan(output_data[i, j]):
+                flag = True
+        if np.linalg.norm(output_data[i]-input_data[i])==0 or flag==True:
+            dup_index.append(i)
+        else:
+            input_copy.append(input_data[i][:])
+            output_copy.append(output_data[i][:])
+    input_data = np.array([val for val in input_copy])
+    output_data = np.array([val for val in output_copy])
+
+    for i in range(len(input_data)):
+        for j in range(len(input_data[i])):
+            if math.isnan(input_data[i, j]):
+                print('NaN in input')
+    for i in range(len(output_data)):
+        for j in range(len(output_data[i])):
+            if math.isnan(output_data[i, j]):
+                print('NaN in output')
+    
+    minbound = np.min([np.min(input_data,axis=0),np.min(output_data,axis=0)],axis=0)
+    maxbound = np.max([np.max(input_data,axis=0),np.max(output_data,axis=0)],axis=0)
+    lower_bound = np.mean([self.problem.xl,minbound],axis=0)
+    upper_bound = np.mean([self.problem.xu,maxbound],axis=0)
+    input_data = normalize(input_data,xl=lower_bound,xu=upper_bound)
+    output_data = normalize(output_data,xl=lower_bound,xu=upper_bound)
+    regr = RandomForestRegressor(max_features=self.problem.n_var, min_samples_split=2, random_state=1, n_estimators=int(self.collection*self.pop_size))
+    regr.fit(input_data,output_data)
+
+    return lower_bound,upper_bound, regr
+
+def co_boundary_repair(p,c,l,u,iters):
+    p[p==c] = (u+l)[p==c]/2
+    normv = np.linalg.norm(p-c)
+    idl,idr = c<l,u<c
+    if sum(idl+idr)==0:
+        data = c
+    else:
+        d = normv*np.max([idl*(l-c)/(p-c),idr*(u-c)/(p-c)],axis=0)
+        alpha = (normv-d)/normv
+        up = np.array([~idl*((l-c)/(p-c)), ~idr*(u-c)/(p-c)])
+        D = normv*min(up[up>0])
+        r = np.random.random()
+        if r==0:
+            Y = d
+        else:
+            atan = (D-d)/(alpha*d)
+            atan = np.array([math.tan(r*math.atan(val)) for val in atan])
+            Y = d*(1+alpha*atan)
+            data = c + (p-c)*Y/normv
+    idl,idr = data<l,u<data
+    if sum(idl+idr)>0:
+        print(iters)
+        if iters<10:
+            co_boundary_repair(p,data,l,u,iters+1)
+        else:
+            print(p,c,data)
+            for i in range(len(data)):
+                if data[i] < l[i] or data[i] > u[i]:
+                    data[i] = l[i] + np.random.random()*abs(u[i] - l[i])
+    return np.array(data)
+
+def boundary_repair(old, new, problem):
+    for i in range(len(new)):
+        if new[i]>problem.xu[i]:
+            new[i] = old[i] + np.random.random()*abs(problem.xu[i]-old[i])
+        elif new[i]<problem.xl[i]:
+            new[i] = problem.xl[i] + np.random.random()*abs(old[i]-problem.xl[i])
+    return new
+
+def co_repair(self, lower_bound, upper_bound, regr):
+    child = np.array([self.off[i].X for i in range (self.pop_size)])
+    child = normalize(child,xl=lower_bound,xu=upper_bound)
+    child = regr.predict(child)
+    child = denormalize(child,lower_bound,upper_bound)
+    for i in range (0,int(self.pop_size*self.co_repair_fraction)):
+        # index = np.random.randint(0,self.pop_size-1)
+        index = i + int(self.pop_size/2) #DEXTER - since the mating is random, doesn't make sense to involve another random selection process
+        self.co_boost = 1 + 0.5*np.random.random()
+        modification = np.array(self.co_boost*(np.array(child[index])-self.off[index].X))
+        original_child = deepcopy(self.off[index].X)
+        self.off[index].X += modification
+
+        """Near Bound Restoration"""
+        for j in range (self.problem.n_var):
+            lower_dist = abs(original_child[j]-self.problem.xl[j])
+            upper_dist = abs(original_child[j]-self.problem.xu[j])
+            if lower_dist<upper_dist:
+                dist=lower_dist
+            else:
+                dist=upper_dist
+            length = abs(self.problem.xu[j]-self.problem.xl[j])
+            if dist<0.01*length:
+                self.off[index].X[j] -= 1.0*(original_child[j])
+            
+        """Variable Boundary Repair"""
+        self.off[index].X = co_boundary_repair(original_child,self.off[index].X,self.problem.xl,self.problem.xu,0)
+        # self.off[index].X = boundary_repair(original_child, self.off[index].X, self.problem)
+
+def update_co_target(self):
+    """update target-dataset: [X,F]*pop_size"""
+    X = [self.pop[i].X for i in range (self.pop_size)]
+    F = [self.pop[i].F for i in range (self.pop_size)]
+
+    """target normalization as per current pop"""
+    nadir_point = self.pop[0].data['nadir_point']
+    ideal_point = self.pop[0].data['ideal_point']
+    if max(nadir_point) == math.inf:
+        nadir_point = np.max(self.pop.get("F"), axis=0)
+    F_norm = normalize(np.array(F), xl = ideal_point-1e-12, xu = nadir_point)
+    assoc_index = []
+    assoc_value = []
+    for obj in F_norm:
+        temp = load_function('calc_perpendicular_distance')([obj],self.ref_dirs)[0]
+        assoc_index.append(np.argmin(temp))
+        assoc_value.append(min(temp))
+
+    """check if a population member can/should replace a target"""
+    for i in range(self.pop_size):
+        index = assoc_index[i]
+        if self.co_target[index][0][0] is None:
+            self.co_target[index][0] = X[i][:]
+            self.co_target[index][1] = F[i][:]
+        else:
+            target_F = normalize(self.co_target[index][1], xl = ideal_point-1e-12, xu = nadir_point)
+            if sum(target_F > F_norm[i]) >= 1 and sum(target_F >= F_norm[i]) == self.problem.n_obj:
+                self.co_target[index][0] = X[i][:]
+                self.co_target[index][1] = F[i][:]
+            elif sum(target_F < F_norm[i]) >= 1 and sum(target_F > F_norm[i]) >= 1:
+                target_perp = load_function('calc_perpendicular_distance')([target_F],[self.ref_dirs[index]])[0][0]
+                if assoc_value[i] < target_perp:
+                    self.co_target[index][0] = X[i][:]
+                    self.co_target[index][1] = F[i][:]
+
+def do_predict(X, regr, problem, eta, category, niche_radius):
+    X = normalize(X, xl=problem.xl, xu=problem.xu)
+    X_ = regr.predict([X])[0]
+    X_ = denormalize(X_, xl=problem.xl, xu=problem.xu)
+    if category =='pit':
+        eta = (-0.5+np.random.random())+eta
+    else:
+        eta = (np.random.random())*eta*(2**0.5)/niche_radius
+    X_ = X + eta*(X_)
+    X_ = boundary_repair(X, X_, problem)
+    # X_ = co_boundary_repair(X, X_, problem.xl, problem.xu, 0)
+    return X_
+
+def do_learn(self): 
+    
+    """Extract the data, normalize objectives"""
+    # X = self.pop.get("X")
+    # F = self.pop.get("F")
+    X = np.array([ind.X for ind in self.pop if ind.data["rank"]==0]) 
+    F = np.array([ind.F for ind in self.pop if ind.data["rank"]==0]) 
+    nadir_point = self.pop[0].data['nadir_point']
+    ideal_point = self.pop[0].data['ideal_point']
+    if max(nadir_point) == math.inf:
+        nadir_point = np.max(self.pop.get("F"), axis=0)
+    F_norm = normalize(F, xl=ideal_point-1e-12, xu=nadir_point)
+    F_norm = np.array([row/sum(row) for row in F_norm])
+
+    """Set the range as per granularity"""
+    min_d = 0.5*self.niche_radius
+    max_d = 1.5*self.niche_radius
+
+    """For each objective, learn an ML model"""
+    for i in range(self.problem.n_obj):
+
+        """Generate the training dataset"""
+        input_data = []
+        output_data = []
+        for j in range(len(F)):
+            """Find the solutions between 0.5*r and 1.5*r (closed bracket)"""
+            indices = [k for k in range(len(F)) if euclidean(self.ref_dirs[self.pop[j].data['niche']], F_norm[k])>=min_d and euclidean(self.ref_dirs[self.pop[j].data['niche']], F_norm[k])<=max_d]
+            # """Find the solutions between 0.5*r and 1.5*r (closed bracket)"""
+            # indices = [k for k in range(len(F)) if euclidean(F_norm[j], F_norm[k])>=min_d and euclidean(F_norm[j], F_norm[k])<=max_d]
+            # """Make sure the solutions belong to some other RV"""
+            # indices = [index for index in indices if self.pop[j].data['niche']!=self.pop[index].data['niche']]
+            if len(indices)>0:
+                """calculate the improvement"""
+                improvement = [(F_norm[index, i]-F_norm[j, i]) for index in indices]
+                """use the solution that offers best improvement (max. negative)"""
+                if min(improvement)<0:
+                    index = np.argmin(improvement)
+                    """only a movement of 'r' is to be learnt in F-space"""
+                    input_data.append(X[j])
+                    output_data.append((X[indices[index]]-X[j]))
+        
+        input_data = np.array(input_data)
+        output_data = np.array(output_data)
+
+        """train the ML model"""
+        if len(input_data)>0:
+            input_data = normalize(input_data, xl=self.problem.xl, xu=self.problem.xu)
+            output_data = normalize(output_data, xl=self.problem.xl, xu=self.problem.xu)
+            self.do_models[i] = KNeighborsRegressor(n_neighbors=min(len(input_data), max(self.problem.n_obj, self.problem.n_var)))
+            # self.do_models[i] = RandomForestRegressor(max_features=self.problem.n_var, min_samples_split=2, random_state=1, n_estimators=int(self.pop_size))
+            self.do_models[i].fit(input_data, output_data)
+
+def do_repair(self):
+    """extract the data, normalize objectives"""
+    X = self.pop.get("X")
+    F = self.pop.get("F") 
+    nadir_point = self.pop[0].data['nadir_point']
+    ideal_point = self.pop[0].data['ideal_point']
+    if max(nadir_point) == math.inf:
+        nadir_point = np.max(self.pop.get("F"), axis=0)
+    F_norm = normalize(F, xl=ideal_point-1e-12, xu=nadir_point)
+    F_norm = np.array([row/sum(row) for row in F_norm])
+
+    """Identify the pits"""
+    niches = np.array([ind.data["niche"] for ind in self.pop])
+    no_of_pits = len(self.ref_dirs) - len(np.unique(niches))
+    pit_indices = np.array([i for i in range(len(self.ref_dirs)) if i not in niches])
+
+    """Identify the boundary RVs with at least one associated solution"""
+    boundary_RVs = np.array([i for i in range(len(self.ref_dirs)) if min(self.ref_dirs[i])==0 and i in niches])
+
+    """Set the repair fraction for the first time"""
+    if self.do_repair_fraction is None:
+        # Rg = self.min_repair[0] + np.random.random()*(self.max_repair[0]-self.min_repair[0])
+        # Rb = self.min_repair[1] + np.random.random()*(self.max_repair[1]-self.min_repair[1])
+        # self.do_repair_fraction = [Rg, Rb]
+        self.do_repair_fraction = [0.25, 0.25]
+
+    """Choose the starting points"""
+    n_repair_pits = int(self.do_repair_fraction[0]*self.pop_size) # for the pits
+    n_repair_boundary = int(self.do_repair_fraction[1]*self.pop_size) # for the boundary
+
+    new_solutions = []
+
+    """Repair the pit solutions"""
+    if n_repair_pits > 0 and no_of_pits>0:
+        if no_of_pits <= n_repair_pits:
+            temp_indices = []
+            while len(temp_indices)<n_repair_pits:
+                temp_indices.extend(np.random.permutation(pit_indices))
+        else:
+            temp_indices = np.random.permutation(pit_indices)
+        for i in range(n_repair_pits):
+            pit = self.ref_dirs[temp_indices[i]]
+            dist = load_function('calc_perpendicular_distance')(F_norm, [pit])
+            nearest_index = np.argmin([row[0] for row in dist])
+            nearest_distance = min([row[0] for row in dist])
+            starting_point = X[nearest_index]
+            """find in which objective max. increment/reduction is needed"""
+            diff_vector = pit-F_norm[nearest_index]
+            abs_diff_vector = np.array([abs(row) for row in diff_vector])
+            index = np.argmax(abs_diff_vector)
+            if diff_vector[index]>0:
+                index = index + self.problem.n_obj
+            if nearest_distance<0.5*self.niche_radius or nearest_distance>1.5*self.niche_radius:
+                progress_length = np.linalg.norm(diff_vector)/self.niche_radius
+            else:
+                progress_length = 1
+            if index<self.problem.n_obj:
+                temp = do_predict(starting_point, self.do_models[index], self.problem, progress_length, 'pit', self.niche_radius)
+            else:
+                temp = do_predict(starting_point, self.do_models[index-self.problem.n_obj], self.problem, -1*progress_length, 'pit', self.niche_radius)
+            new_solutions.append(temp)
+
+    """Repair the boundary solutions"""
+    if n_repair_boundary > 0 and len(boundary_RVs) > 0:
+        if len(boundary_RVs) <= n_repair_boundary:
+            temp_indices = []
+            while len(temp_indices)<n_repair_boundary:
+                temp_indices.extend(np.random.permutation(boundary_RVs))
+        else:
+            temp_indices = np.random.permutation(boundary_RVs)
+        for i in range(n_repair_boundary):
+            index_RV = temp_indices[i] 
+            RV = self.ref_dirs[index_RV]
+            nearest_index = np.where(niches==index_RV)[0]
+            if len(nearest_index)>1:
+                nearest_index = nearest_index[np.random.choice(len(nearest_index))]
+            else:
+                nearest_index = nearest_index[0]
+            starting_point = X[nearest_index]
+            index_model = np.where(RV==0)[0]
+            if len(index_model)>1:
+                index_model = index_model[np.random.choice(len(index_model))]
+            else:
+                index_model = index_model[0]
+            if self.problem.n_obj==2:
+                temp = do_predict(starting_point, self.do_models[index_model], self.problem, 1, 'boundary', self.niche_radius)
+            else:
+                temp = do_predict(starting_point, self.do_models[index_model], self.problem, 1, 'boundary', self.niche_radius)
+            new_solutions.append(temp)
+
+    for i in range(len(new_solutions)):
+        for j in range(len(new_solutions[i])):
+            if math.isnan(new_solutions[i][j]):
+                print('NaN in DO-offspring')
+    
+    return new_solutions
