@@ -20,6 +20,7 @@ from scipy.spatial.distance import cdist, euclidean
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neighbors import KNeighborsRegressor
 from pymoo.util.normalization import normalize, denormalize
+from pymoo.util.misc import calc_perpendicular_distance
 
 # =========================================================================================================
 # Implementation
@@ -55,6 +56,8 @@ class NSGA3(GeneticAlgorithm):
                  output=MultiObjectiveOutput(),
                  is_co_learn = False,
                  is_do_learn = False,
+                 co_repair_fraction = 0.5,
+                 do_repair_fraction = [0.25, 0.25],
                  **kwargs):
         """
 
@@ -94,7 +97,8 @@ class NSGA3(GeneticAlgorithm):
         self.co_survived = []
         self.last_co_repair = 0
         self.is_co_learn = is_co_learn
-        self.archive = []
+        self.co_repair_fraction = co_repair_fraction
+        self.history = []
 
         """Set the DO related parameters"""
         self.do_state = [0, 0, 0]
@@ -102,6 +106,7 @@ class NSGA3(GeneticAlgorithm):
         self.do_survived = []
         self.last_do_learn = 0
         self.is_do_learn = is_do_learn
+        self.do_repair_fraction = do_repair_fraction
 
         if pop_size is None:
             pop_size = len(self.ref_dirs)
@@ -170,17 +175,17 @@ class NSGA3(GeneticAlgorithm):
 
     def _infill(self):
 
-        if self.n_gen % 100 == 0:
+        if self.n_gen % 25 == 0:
             print("# Generation: " + str(self.n_gen))
 
         if self.is_co_learn:
-            self.archive.append(self.pop)
+            self.history.append(self.pop)
 
         """Should we start CO?"""
         if self.is_co_learn and self.co_start:
             update_co_target(self)
             if self.n_gen>self.collection+1 and self.n_gen-self.last_co_repair>=self.co_frequency:
-                print('CO learning now')
+                # print('CO learning now')
                 lower_bound,upper_bound, RF_model = co_learn(self)
 
         """Set the trigger of non-domination"""
@@ -200,7 +205,7 @@ class NSGA3(GeneticAlgorithm):
 
         """Call the Learn function"""
         if self.is_do_learn and self.do_trigger2 and self.n_gen-self.last_do_learn>=self.do_frequency:
-            print('DO learning now')
+            # print('DO learning now')
             do_learn(self)
 
         """Do the mating to produce the offspring self.off"""
@@ -216,7 +221,7 @@ class NSGA3(GeneticAlgorithm):
 
         """repair step:"""
         if self.n_gen>self.collection+1 and self.is_co_learn and self.n_gen-self.last_co_repair>=self.co_frequency and self.co_start:
-            print('CO repairing now')
+            # print('CO repairing now')
             self.last_co_repair = self.n_gen
             co_repair(self, lower_bound,upper_bound, RF_model)
 
@@ -224,7 +229,7 @@ class NSGA3(GeneticAlgorithm):
         if self.is_do_learn and self.do_trigger2 and self.n_gen-self.last_do_learn>=self.do_frequency:
             temp = [1 for model in self.do_models if model is None]
             if sum(temp)==0:
-                print('DO repairing now')
+                # print('DO repairing now')
                 self.last_do_learn = self.n_gen
                 new_solutions = do_repair(self)
                 sequence = np.arange(int(self.pop_size/2)) #DEXTER - offspring generated are already randomized - doesn't make sense to use another random input there
@@ -331,9 +336,9 @@ def update_termination_archives(self,Q):
         else:
             P_norm = np.array([(pt-ideal_point) for pt in P])
             Q_norm = np.array([(pt-ideal_point) for pt in Q])
-        dist_matrix = load_function('calc_perpendicular_distance')(P_norm, self.ref_dirs)
+        dist_matrix = calc_perpendicular_distance(P_norm, self.ref_dirs)
         assoc_P = np.array([np.argmin(row) for row in dist_matrix])
-        dist_matrix = load_function('calc_perpendicular_distance')(Q_norm, self.ref_dirs)
+        dist_matrix = calc_perpendicular_distance(Q_norm, self.ref_dirs)
         assoc_Q = np.array([np.argmin(row) for row in dist_matrix])
         mu_D = 0
         count = 0
@@ -628,7 +633,7 @@ def co_learn(self):
             design_data.append(row.X)
 
     """Adding the first parent pop to the archive"""
-    for row in self.archive[-(self.collection+1)]:
+    for row in self.history[-(self.collection+1)]:
         obj_data.append(row.F)
         design_data.append(row.X)
 
@@ -637,9 +642,9 @@ def co_learn(self):
     ideal_point = self.pop[0].data['ideal_point']
     if max(nadir_point) == math.inf:
         nadir_point = np.max(self.pop.get("F"), axis=0)
-    obj_data = normalize(obj_data, xl = ideal_point-1e-12, xu = nadir_point)
+    obj_data = normalize(np.array(obj_data), xl = np.array(ideal_point)-1e-12, xu = np.array(nadir_point))
     for i in range(len(design_data)):
-        temp = load_function('calc_perpendicular_distance')([obj_data[i]],self.ref_dirs)[0]
+        temp = calc_perpendicular_distance([obj_data[i]],self.ref_dirs)[0]
         ref_index = np.argmin(temp)
         if self.co_target[ref_index][0][0] is not None:
             input_data.append(design_data[i])
@@ -767,7 +772,7 @@ def update_co_target(self):
     assoc_index = []
     assoc_value = []
     for obj in F_norm:
-        temp = load_function('calc_perpendicular_distance')([obj],self.ref_dirs)[0]
+        temp = calc_perpendicular_distance([obj],self.ref_dirs)[0]
         assoc_index.append(np.argmin(temp))
         assoc_value.append(min(temp))
 
@@ -783,7 +788,7 @@ def update_co_target(self):
                 self.co_target[index][0] = X[i][:]
                 self.co_target[index][1] = F[i][:]
             elif sum(target_F < F_norm[i]) >= 1 and sum(target_F > F_norm[i]) >= 1:
-                target_perp = load_function('calc_perpendicular_distance')([target_F],[self.ref_dirs[index]])[0][0]
+                target_perp = calc_perpendicular_distance([target_F],[self.ref_dirs[index]])[0][0]
                 if assoc_value[i] < target_perp:
                     self.co_target[index][0] = X[i][:]
                     self.co_target[index][1] = F[i][:]
@@ -895,7 +900,7 @@ def do_repair(self):
             temp_indices = np.random.permutation(pit_indices)
         for i in range(n_repair_pits):
             pit = self.ref_dirs[temp_indices[i]]
-            dist = load_function('calc_perpendicular_distance')(F_norm, [pit])
+            dist = calc_perpendicular_distance(F_norm, [pit])
             nearest_index = np.argmin([row[0] for row in dist])
             nearest_distance = min([row[0] for row in dist])
             starting_point = X[nearest_index]
