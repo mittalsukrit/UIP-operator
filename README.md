@@ -1,6 +1,6 @@
 # UIP-operator
 This repository contains the source codes for the Unified Innovized Progress (UIP) operator, integrated with NSGA-III. A manuscript based on the UIP operator has been published in IEEE Transactions on Evolutionary Computation. <br>
-Link: [https://ieeexplore.ieee.org/abstract/document/9814856](https://ieeexplore.ieee.org/document/10269130)
+Link: https://ieeexplore.ieee.org/document/10269130
 
 # Requirements
 For running the codes, make sure you have Python 3.8 or above installed: https://www.python.org/ <br>
